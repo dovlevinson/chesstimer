@@ -1,0 +1,506 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Play, Pause, RotateCcw, Trophy, Settings, AlertCircle, ChevronRight, RefreshCw } from 'lucide-react';
+
+const TEAMS = [
+  { id: 'pesach', name: 'Pesach', color: 'bg-blue-600', ring: 'ring-blue-400', text: 'text-blue-600' },
+  { id: 'sukkot', name: 'Sukkot', color: 'bg-green-600', ring: 'ring-green-400', text: 'text-green-600' },
+  { id: 'shavuot', name: 'Shavuot', color: 'bg-red-600', ring: 'ring-red-400', text: 'text-red-600' }
+];
+
+export default function App() {
+  // Game Configuration State
+  const [startingMinutes, setStartingMinutes] = useState(1);
+  const [startingSeconds, setStartingSeconds] = useState(0);
+  
+  // Game Status State
+  const [phase, setPhase] = useState('setup'); // setup, playing, roundOver
+  const [scores, setScores] = useState({ pesach: 0, sukkot: 0, shavuot: 0 });
+  const [round, setRound] = useState(1);
+
+  // Active Round State
+  const [timeRemaining, setTimeRemaining] = useState({ pesach: 0, sukkot: 0, shavuot: 0 });
+  const [activeTeam, setActiveTeam] = useState(null);
+  const [isPaused, setIsPaused] = useState(true);
+  const [eliminated, setEliminated] = useState([]);
+  const [eliminationAlert, setEliminationAlert] = useState(null); // Tracks the ID of the team that just got out
+  const [confirmDialog, setConfirmDialog] = useState(null); // Custom confirm modal state
+
+  const audioCtxRef = useRef(null);
+
+  // Format time (e.g., 65 -> 01:05)
+  const formatTime = (seconds) => {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  };
+
+  // Initialize Audio Context (required by iOS Safari to play sound later)
+  const initAudio = () => {
+    if (!audioCtxRef.current) {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      audioCtxRef.current = new AudioContext();
+    }
+    if (audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume();
+    }
+  };
+
+  // Play the loud buzz sound when someone is eliminated
+  const playBuzzer = () => {
+    try {
+      const ctx = audioCtxRef.current;
+      if (!ctx) return;
+      const osc1 = ctx.createOscillator();
+      const osc2 = ctx.createOscillator();
+      const gainNode = ctx.createGain();
+      
+      // Harsh dissonant frequencies for "Ehhhhh" game show buzzer
+      osc1.type = 'square';
+      osc1.frequency.setValueAtTime(120, ctx.currentTime);
+      
+      osc2.type = 'sawtooth';
+      osc2.frequency.setValueAtTime(125, ctx.currentTime);
+      
+      gainNode.gain.setValueAtTime(0.5, ctx.currentTime);
+      gainNode.gain.setValueAtTime(0.5, ctx.currentTime + 0.8);
+      gainNode.gain.linearRampToValueAtTime(0.01, ctx.currentTime + 1.0);
+      
+      osc1.connect(gainNode);
+      osc2.connect(gainNode);
+      gainNode.connect(ctx.destination);
+      
+      osc1.start();
+      osc2.start();
+      osc1.stop(ctx.currentTime + 1);
+      osc2.stop(ctx.currentTime + 1);
+    } catch (e) {
+      console.error("Audio error", e);
+    }
+  };
+
+  // Start a new round
+  const handleStartRound = (startingTeamId) => {
+    initAudio(); // Unlock audio on first user interaction
+    const totalSeconds = (startingMinutes * 60) + startingSeconds;
+    setTimeRemaining({
+      pesach: totalSeconds,
+      sukkot: totalSeconds,
+      shavuot: totalSeconds
+    });
+    setActiveTeam(startingTeamId);
+    setEliminated([]);
+    setEliminationAlert(null);
+    setIsPaused(false);
+    setPhase('playing');
+  };
+
+  // Timer Tick Logic
+  useEffect(() => {
+    let interval = null;
+    if (!isPaused && activeTeam && phase === 'playing' && !eliminationAlert) {
+      interval = setInterval(() => {
+        setTimeRemaining(prev => {
+          const newTime = prev[activeTeam] - 1;
+          
+          if (newTime <= 0) {
+            clearInterval(interval); // Stop immediately
+            handleElimination(activeTeam);
+            return { ...prev, [activeTeam]: 0 };
+          }
+          return { ...prev, [activeTeam]: newTime };
+        });
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [isPaused, activeTeam, phase, eliminationAlert, eliminated]);
+
+  // Handle a team running out of time
+  const handleElimination = (teamId) => {
+    playBuzzer();
+    const newEliminated = [...eliminated, teamId];
+    setEliminated(newEliminated);
+    
+    if (newEliminated.length >= 2) {
+      // Round is over. The remaining team wins.
+      const winner = TEAMS.find(t => !newEliminated.includes(t.id)).id;
+      endRound(winner);
+    } else {
+      // Pause the game and show the alert so they have to physically pass it
+      setIsPaused(true);
+      setEliminationAlert(teamId);
+    }
+  };
+
+  // End the round and calculate points
+  const endRound = (winnerId) => {
+    setPhase('roundOver');
+    setIsPaused(true);
+    setActiveTeam(winnerId); // the winner
+    
+    // Award 1 Win to the last team standing
+    setScores(prev => ({
+      ...prev,
+      [winnerId]: prev[winnerId] + 1
+    }));
+  };
+
+  // Main action handler for the Spacebar / Giant Button Tap
+  const handleSmashAction = () => {
+    if (eliminationAlert) {
+      // Clear the alert, resume the game, and pass to the next team
+      setEliminationAlert(null);
+      setIsPaused(false);
+      passTurn(eliminationAlert, eliminated);
+    } else if (!isPaused && phase === 'playing') {
+      // Normal turn pass
+      passTurn(activeTeam, eliminated);
+    }
+  };
+
+  // Pass turn to the next non-eliminated team
+  const passTurn = (currentTeamId, currentEliminated) => {
+    if (!currentTeamId) return;
+    
+    const currentIndex = TEAMS.findIndex(t => t.id === currentTeamId);
+    let nextIndex = (currentIndex + 1) % TEAMS.length;
+
+    // Skip eliminated teams
+    while (currentEliminated.includes(TEAMS[nextIndex].id) && nextIndex !== currentIndex) {
+      nextIndex = (nextIndex + 1) % TEAMS.length;
+    }
+
+    if (nextIndex !== currentIndex) {
+      setActiveTeam(TEAMS[nextIndex].id);
+    }
+  };
+
+  // Reset the current round's timers without ending it
+  const handleResetRound = () => {
+    setConfirmDialog({
+      message: 'Restart this round timers?',
+      onConfirm: () => {
+        const totalSeconds = (startingMinutes * 60) + startingSeconds;
+        setTimeRemaining({
+          pesach: totalSeconds,
+          sukkot: totalSeconds,
+          shavuot: totalSeconds
+        });
+        setEliminated([]);
+        setEliminationAlert(null);
+        setIsPaused(true);
+        setConfirmDialog(null);
+      }
+    });
+  };
+
+  // Reset the entire game
+  const handleResetGame = () => {
+    setConfirmDialog({
+      message: 'Wipe all scores and start over completely?',
+      onConfirm: () => {
+        setScores({ pesach: 0, sukkot: 0, shavuot: 0 });
+        setRound(1);
+        setConfirmDialog(null);
+      }
+    });
+  };
+
+  // Spacebar listener for the big button
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.code === 'Space' && phase === 'playing') {
+        e.preventDefault(); // Prevent page scroll
+        handleSmashAction();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [activeTeam, isPaused, phase, eliminated, eliminationAlert]);
+
+  // Helper to render the custom confirm modal
+  const renderConfirmModal = () => {
+    if (!confirmDialog) return null;
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm px-4">
+        <div className="bg-gray-800 p-8 rounded-2xl border border-gray-600 shadow-2xl max-w-sm w-full text-center">
+          <h3 className="text-xl font-bold mb-6 text-white">{confirmDialog.message}</h3>
+          <div className="flex space-x-4">
+            <button 
+              onClick={() => setConfirmDialog(null)}
+              className="flex-1 py-3 bg-gray-600 hover:bg-gray-500 rounded-xl font-bold transition-colors"
+            >
+              Cancel
+            </button>
+            <button 
+              onClick={confirmDialog.onConfirm}
+              className="flex-1 py-3 bg-red-600 hover:bg-red-500 rounded-xl font-bold transition-colors"
+            >
+              Confirm
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // --- RENDERING VIEWS ---
+
+  if (phase === 'setup') {
+    return (
+      <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center p-6 font-sans">
+        <div className="bg-gray-800 p-8 rounded-2xl shadow-2xl w-full max-w-md border border-gray-700 relative">
+          
+          {round > 1 && (
+            <button 
+              onClick={handleResetGame}
+              className="absolute top-4 right-4 text-gray-500 hover:text-red-400 transition-colors"
+              title="Reset Entire Game"
+            >
+              <RefreshCw className="w-5 h-5" />
+            </button>
+          )}
+
+          <div className="flex items-center justify-center mb-6 mt-2">
+            <Settings className="w-8 h-8 mr-3 text-blue-400" />
+            <h1 className="text-3xl font-bold text-center">Setup Round {round}</h1>
+          </div>
+          
+          <div className="space-y-6">
+            <div>
+              <label className="block text-gray-400 mb-2 font-semibold">Time Per Team</label>
+              <div className="flex space-x-4">
+                <div className="flex-1">
+                  <input 
+                    type="number" 
+                    min="0"
+                    value={startingMinutes}
+                    onChange={(e) => setStartingMinutes(Number(e.target.value))}
+                    className="w-full bg-gray-900 border border-gray-600 rounded-lg p-3 text-2xl text-center text-white focus:ring-2 focus:ring-blue-500 outline-none"
+                  />
+                  <div className="text-center text-sm text-gray-500 mt-1">Minutes</div>
+                </div>
+                <div className="text-4xl font-bold flex items-center justify-center pb-6">:</div>
+                <div className="flex-1">
+                  <input 
+                    type="number" 
+                    min="0"
+                    max="59"
+                    value={startingSeconds}
+                    onChange={(e) => setStartingSeconds(Number(e.target.value))}
+                    className="w-full bg-gray-900 border border-gray-600 rounded-lg p-3 text-2xl text-center text-white focus:ring-2 focus:ring-blue-500 outline-none"
+                  />
+                  <div className="text-center text-sm text-gray-500 mt-1">Seconds</div>
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-gray-400 mb-3 font-semibold">Who Goes First?</label>
+              <div className="grid gap-3">
+                {TEAMS.map(team => (
+                  <button
+                    key={team.id}
+                    onClick={() => handleStartRound(team.id)}
+                    className={`w-full py-4 px-6 rounded-xl font-bold text-lg text-white shadow-lg transition-transform transform hover:scale-105 active:scale-95 flex justify-between items-center ${team.color}`}
+                  >
+                    <span>Start with {team.name}</span>
+                    <Play className="w-5 h-5 opacity-70" />
+                  </button>
+                ))}
+              </div>
+            </div>
+            
+            <div className="pt-4 border-t border-gray-700 mt-6">
+              <h3 className="text-gray-400 mb-2 text-center text-sm font-semibold uppercase tracking-wider">Total Wins</h3>
+              <div className="flex justify-between px-4 text-lg">
+                <span className="text-blue-400 font-bold">Pesach: {scores.pesach}</span>
+                <span className="text-green-400 font-bold">Sukkot: {scores.sukkot}</span>
+                <span className="text-red-400 font-bold">Shavuot: {scores.shavuot}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        {renderConfirmModal()}
+      </div>
+    );
+  }
+
+  if (phase === 'roundOver') {
+    const winnerTeam = TEAMS.find(t => t.id === activeTeam);
+    return (
+      <div className="min-h-screen bg-gray-900 text-white flex flex-col items-center justify-center p-6 font-sans">
+        <div className="bg-gray-800 p-10 rounded-3xl shadow-2xl w-full max-w-lg border border-gray-700 text-center relative overflow-hidden">
+          <Trophy className={`w-32 h-32 mx-auto mb-4 ${winnerTeam.text}`} />
+          
+          <h1 className="text-3xl font-bold mb-2 text-gray-300">Round {round} Winner!</h1>
+          <h2 className={`text-5xl font-extrabold mb-8 uppercase tracking-widest ${winnerTeam.text}`}>
+            {winnerTeam.name}
+          </h2>
+          
+          <div className="pt-6 border-t border-gray-700">
+            <h3 className="text-gray-400 mb-4 text-sm font-semibold uppercase tracking-wider">Total Wins Leaderboard</h3>
+            <div className="flex justify-between px-2 text-2xl mb-8 font-black">
+              <div className="flex flex-col items-center"><span className="text-sm text-gray-500 font-bold uppercase mb-1">Pesach</span><span className="text-blue-400">{scores.pesach}</span></div>
+              <div className="flex flex-col items-center"><span className="text-sm text-gray-500 font-bold uppercase mb-1">Sukkot</span><span className="text-green-400">{scores.sukkot}</span></div>
+              <div className="flex flex-col items-center"><span className="text-sm text-gray-500 font-bold uppercase mb-1">Shavuot</span><span className="text-red-400">{scores.shavuot}</span></div>
+            </div>
+
+            <button
+              onClick={() => {
+                setRound(prev => prev + 1);
+                setPhase('setup');
+              }}
+              className="w-full py-4 bg-white text-gray-900 font-bold rounded-xl text-xl hover:bg-gray-200 transition-colors shadow-lg flex items-center justify-center"
+            >
+              Setup Round {round + 1} <ChevronRight className="ml-2 w-6 h-6" />
+            </button>
+          </div>
+        </div>
+        {renderConfirmModal()}
+      </div>
+    );
+  }
+
+  // --- PLAYING VIEW ---
+  return (
+    <div className={`min-h-screen ${eliminationAlert ? 'bg-red-950' : 'bg-gray-900'} text-white flex flex-col font-sans select-none overflow-hidden transition-colors duration-300`}>
+      
+      {/* Top Bar (Controls & Standings) */}
+      <div className="bg-gray-800 p-4 flex justify-between items-center border-b border-gray-700 shadow-md">
+        <div className="flex items-center space-x-4">
+          <button 
+            onClick={() => setIsPaused(!isPaused)}
+            disabled={!!eliminationAlert}
+            className={`w-12 h-12 flex items-center justify-center rounded-full transition-colors ${eliminationAlert ? 'bg-gray-800 opacity-50' : 'bg-gray-700 hover:bg-gray-600'}`}
+          >
+            {isPaused ? <Play className="w-6 h-6 text-green-400" /> : <Pause className="w-6 h-6 text-yellow-400" />}
+          </button>
+          <div className="text-sm font-semibold text-gray-400">
+            Round {round}
+            <span className={`ml-2 px-2 py-1 rounded text-xs font-bold ${eliminationAlert ? 'bg-red-900 text-red-200' : 'bg-gray-700'}`}>
+              {eliminationAlert ? 'TEAM OUT' : (isPaused ? 'PAUSED' : 'LIVE')}
+            </span>
+          </div>
+        </div>
+
+        <div className="flex space-x-6 text-sm font-bold bg-gray-900 px-6 py-2 rounded-full border border-gray-700">
+          <span className="text-blue-400">Wins: {scores.pesach}</span>
+          <span className="text-green-400">Wins: {scores.sukkot}</span>
+          <span className="text-red-400">Wins: {scores.shavuot}</span>
+        </div>
+        
+        <div className="flex space-x-4">
+          <button 
+            onClick={handleResetRound}
+            className="text-gray-500 hover:text-blue-400 transition-colors"
+            title="Restart Timers for this Round"
+          >
+            <RotateCcw className="w-6 h-6" />
+          </button>
+          <button 
+            onClick={() => {
+              setConfirmDialog({
+                message: 'Back to setup? You will lose this round progress.',
+                onConfirm: () => {
+                  setPhase('setup');
+                  setConfirmDialog(null);
+                }
+              });
+            }}
+            className="text-gray-500 hover:text-red-400 transition-colors"
+            title="End Round Early"
+          >
+            <Settings className="w-6 h-6" />
+          </button>
+        </div>
+      </div>
+
+      {/* Main Game Area */}
+      <div className="flex-1 flex flex-col relative p-6">
+        
+        {/* Referee Hint */}
+        <div className="text-center text-gray-500 mb-4 flex items-center justify-center opacity-70">
+          <AlertCircle className="w-4 h-4 mr-2" />
+          <span className="text-sm">Referee: Tap a team's card to forcefully give them the turn.</span>
+        </div>
+
+        {/* Team Cards Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 flex-1 max-h-[60vh]">
+          {TEAMS.map(team => {
+            const isActive = activeTeam === team.id;
+            const isEliminated = eliminated.includes(team.id);
+            const justGotOut = eliminationAlert === team.id;
+            const time = timeRemaining[team.id];
+            
+            // Urgency styles
+            let timerColor = "text-white";
+            if (time <= 10 && time > 0) timerColor = "text-red-400 animate-pulse";
+            if (isEliminated) timerColor = "text-gray-600";
+
+            return (
+              <div 
+                key={team.id}
+                onClick={() => {
+                  if (!isEliminated && phase === 'playing') setActiveTeam(team.id);
+                }}
+                className={`relative flex flex-col items-center justify-center rounded-3xl p-6 transition-all duration-300 cursor-pointer border-4
+                  ${isActive && !isPaused && !eliminationAlert ? `${team.color} scale-105 shadow-[0_0_40px_rgba(0,0,0,0.5)] shadow-${team.color.split('-')[1]}-500/50 z-10 border-white` : 'bg-gray-800 border-transparent hover:border-gray-600 opacity-80'}
+                  ${isEliminated && !justGotOut ? 'opacity-30 grayscale cursor-not-allowed border-transparent bg-gray-900' : ''}
+                  ${justGotOut ? 'bg-red-600 border-white animate-bounce scale-110 z-20' : ''}
+                `}
+              >
+                {/* Team Name */}
+                <h2 className={`text-3xl font-black uppercase tracking-widest mb-4 ${isActive || justGotOut ? 'text-white' : team.text} opacity-90`}>
+                  {team.name}
+                </h2>
+                
+                {/* Timer Display */}
+                <div className={`font-mono font-black tabular-nums tracking-tighter ${timerColor} ${isActive ? 'text-8xl md:text-9xl' : 'text-7xl md:text-8xl'}`}>
+                  {formatTime(time)}
+                </div>
+
+                {(isEliminated && !justGotOut) && (
+                  <div className="absolute inset-0 flex items-center justify-center backdrop-blur-[2px] rounded-3xl">
+                    <div className="bg-red-600 text-white font-black text-4xl py-2 px-8 rounded-xl shadow-2xl transform -rotate-12 border-4 border-red-900">
+                      OUT
+                    </div>
+                  </div>
+                )}
+                
+                {justGotOut && (
+                  <div className="absolute -top-6 bg-yellow-400 text-red-900 font-black px-6 py-2 rounded-full uppercase tracking-widest shadow-lg border-2 border-white animate-pulse">
+                    Out of Time!
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* GIANT SMASH BUTTON */}
+        <div className="mt-auto pt-8 flex justify-center">
+          <button
+            // We use onPointerDown for zero-latency touch response on iPads!
+            onPointerDown={handleSmashAction} 
+            className={`
+              w-full max-w-4xl py-10 md:py-14 rounded-3xl text-4xl md:text-5xl font-black uppercase tracking-widest shadow-2xl transition-all duration-100 touch-manipulation select-none
+              ${eliminationAlert
+                ? 'bg-red-600 text-white border-b-8 border-red-800 animate-pulse hover:bg-red-500' 
+                : isPaused 
+                  ? 'bg-gray-800 text-gray-600 border-4 border-gray-700 cursor-not-allowed' 
+                  : 'bg-white text-gray-900 hover:bg-gray-100 active:scale-95 active:bg-gray-300 border-b-8 border-gray-400'}
+            `}
+          >
+            {eliminationAlert 
+              ? 'TEAM OUT! TAP TO CONTINUE' 
+              : isPaused 
+                ? 'Timer Paused' 
+                : 'PASS TURN'}
+          </button>
+        </div>
+
+      </div>
+      {renderConfirmModal()}
+    </div>
+  );
+}
